@@ -1,0 +1,160 @@
+diff --git a/src/xrt/drivers/CMakeLists.txt b/src/xrt/drivers/CMakeLists.txt
+index a91668b..d4e13c1 100644
+--- a/src/xrt/drivers/CMakeLists.txt
++++ b/src/xrt/drivers/CMakeLists.txt
+@@ -87,0 +88,19 @@
++if(XRT_BUILD_DRIVER_QWERTY)
++	add_library(flow_motion_controller_rust STATIC IMPORTED GLOBAL)
++	set_target_properties(
++		flow_motion_controller_rust
++		PROPERTIES IMPORTED_LOCATION
++			   "${CMAKE_SOURCE_DIR}/flow_motion_controller_target/release/libflow_motion_controller.a"
++		)
++	add_library(
++		drv_flow_motion_controller STATIC
++		flow_motion_controller/flow_motion_controller.c
++		flow_motion_controller/flow_motion_controller.h
++		flow_motion_controller/flow_motion_controller_bindings.h
++		)
++	target_include_directories(drv_flow_motion_controller PUBLIC flow_motion_controller)
++	target_link_libraries(
++		drv_flow_motion_controller PRIVATE xrt-interfaces aux_util aux_vive
++						flow_motion_controller_rust pthread dl m
++	)
++endif()
+
+diff --git a/src/xrt/targets/common/CMakeLists.txt b/src/xrt/targets/common/CMakeLists.txt
+index 4f1e4a7..e5fdc11 100644
+--- a/src/xrt/targets/common/CMakeLists.txt
++++ b/src/xrt/targets/common/CMakeLists.txt
+@@ -60,0 +61,3 @@
++if(XRT_BUILD_DRIVER_QWERTY)
++	target_link_libraries(target_lists PRIVATE drv_flow_motion_controller)
++endif()
+
+diff --git a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+--- a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
++++ b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+@@ -180,2 +180,3 @@
+-	c->frame_thread = std::thread([c] {
+-		while (c->frame_thread_run.load()) {
++	Context *context = c.get();
++	c->frame_thread = std::thread([context] {
++		while (context->frame_thread_run.load()) {
+@@ -186 +187 @@
+-			for (vr::IServerTrackedDeviceProvider *const &provider : c->providers)
++			for (vr::IServerTrackedDeviceProvider *const &provider : context->providers)
+@@ -188 +189 @@
+-			c->frame_thread_event.try_acquire_until(next);
++			context->frame_thread_event.try_acquire_until(next);
+@@ -935,9 +936,15 @@
+-		if (left != XRT_DEVICE_ROLE_UNASSIGNED) {
+-			auto *left_dev = static_cast<ControllerDevice *>(xsysd->static_xdevs[left]);
+-			left_dev->set_active_hand(XRT_HAND_LEFT);
+-		}
+-
+-		if (right != XRT_DEVICE_ROLE_UNASSIGNED) {
+-			auto *right_dev = static_cast<ControllerDevice *>(xsysd->static_xdevs[right]);
+-			right_dev->set_active_hand(XRT_HAND_RIGHT);
+-		}
++		auto set_active_hand = [xsysd](int role, enum xrt_hand hand) {
++			if (role == XRT_DEVICE_ROLE_UNASSIGNED) {
++				return;
++			}
++
++			for (ControllerDevice *controller : svrs->ctx->controller) {
++				if (controller == xsysd->static_xdevs[role]) {
++					controller->set_active_hand(hand);
++					return;
++				}
++			}
++		};
++
++		set_active_hand(left, XRT_HAND_LEFT);
++		set_active_hand(right, XRT_HAND_RIGHT);
+
+diff --git a/src/xrt/targets/common/target_builder_steamvr.c b/src/xrt/targets/common/target_builder_steamvr.c
+index 9d535686..8b0ae562 100644
+--- a/src/xrt/targets/common/target_builder_steamvr.c
++++ b/src/xrt/targets/common/target_builder_steamvr.c
+@@ -15,2 +15,8 @@
+ #include <assert.h>
+ #include <stdbool.h>
++#include <signal.h>
++#include <string.h>
++
++#ifdef XRT_BUILD_DRIVER_QWERTY
++#include "flow_motion_controller.h"
++#endif
+@@ -64,0 +69,5 @@
++#ifdef XRT_BUILD_DRIVER_QWERTY
++DEBUG_GET_ONCE_BOOL_OPTION(fmc_enable, "FMC_ENABLE", false)
++DEBUG_GET_ONCE_OPTION(fmc_left_serial, "FMC_LEFT_TRACKER_SERIAL", "")
++DEBUG_GET_ONCE_OPTION(fmc_right_serial, "FMC_RIGHT_TRACKER_SERIAL", "")
++#endif
+@@ -153,0 +164 @@
++		xrt_system_devices_destroy(out_xsysd);
+@@ -157,0 +169,63 @@
++#ifdef XRT_BUILD_DRIVER_QWERTY
++	if (debug_get_bool_option_fmc_enable()) {
++		const char *serials[2] = {
++		    debug_get_option_fmc_left_serial(),
++		    debug_get_option_fmc_right_serial(),
++		};
++		struct xrt_device *trackers[2] = {NULL, NULL};
++		struct xrt_device *controllers[2] = {NULL, NULL};
++		void *runtime = flow_motion_rust_create();
++
++		if (runtime == NULL) {
++			SVR_ERROR("Failed to start the Flow Motion Controller socket server");
++		} else {
++			for (size_t hand = 0; hand < 2; hand++) {
++				if (serials[hand][0] == '\0') {
++					SVR_ERROR("FMC_%s_TRACKER_SERIAL is empty", hand == 0 ? "LEFT" : "RIGHT");
++					continue;
++				}
++				for (size_t i = 0; i < xsysd->static_xdev_count; i++) {
++					if (strcmp(xsysd->static_xdevs[i]->serial, serials[hand]) == 0) {
++						trackers[hand] = xsysd->static_xdevs[i];
++						break;
++					}
++				}
++				if (trackers[hand] == NULL) {
++					SVR_ERROR("No SteamVR tracker with serial '%s' was found", serials[hand]);
++				}
++			}
++
++			for (size_t hand = 0; hand < 2; hand++) {
++				bool is_left = hand == 0;
++				if (flow_motion_rust_should_calibrate(runtime, is_left)) {
++					bool success = trackers[hand] != NULL &&
++					               flow_motion_controller_calibrate(
++					                   trackers[hand], xsysd->static_roles.head, runtime, is_left);
++					flow_motion_rust_write_calibration_status(runtime, success);
++					raise(SIGTERM);
++				}
++			}
++
++			size_t controller_count = (trackers[0] != NULL) + (trackers[1] != NULL);
++			if (xsysd->static_xdev_count + controller_count > XRT_SYSTEM_MAX_DEVICES) {
++				SVR_ERROR("No free xrt_system device slots for Flow Motion Controllers");
++			} else {
++				for (size_t hand = 0; hand < 2; hand++) {
++					if (trackers[hand] == NULL) {
++						continue;
++					}
++					void *state = flow_motion_rust_clone(runtime);
++					controllers[hand] = flow_motion_controller_create(trackers[hand], state, hand == 0);
++				}
++
++				/* Monado's IPC compositor assumes the HMD remains device 0. */
++				for (size_t hand = 0; hand < 2; hand++) {
++					if (controllers[hand] != NULL) {
++						xsysd->static_xdevs[xsysd->static_xdev_count++] = controllers[hand];
++					}
++				}
++			}
++			flow_motion_rust_destroy(runtime);
++		}
++	}
++#endif

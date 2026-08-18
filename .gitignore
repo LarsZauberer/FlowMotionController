@@ -1,0 +1,8 @@
+/target
+/result
+/firmware-result
+/firmware/firmware-config.toml
+*.swp
+
+.direnv/
+.envrc

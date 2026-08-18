@@ -1,0 +1,8 @@
+language = "C"
+include_guard = "FLOW_MOTION_CONTROLLER_H"
+pragma_once = true
+usize_is_size_t = true
+style = "both"
+
+[export]
+include = ["FlowMotionInput"]

@@ -1,0 +1,15 @@
+[package]
+name = "flow_motion_controller"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+members = ["firmware"]
+resolver = "2"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
